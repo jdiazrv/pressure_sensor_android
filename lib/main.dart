@@ -261,7 +261,7 @@ class _UdpTelemetryPacket {
 class DeviceService {
   DeviceService();
 
-  static const Duration timeout = Duration(milliseconds: 1500);
+  static const Duration timeout = Duration(milliseconds: 3000);
   static const Duration probeTimeout = Duration(milliseconds: 2200);
   final http.Client _client = http.Client();
   String host = '';
@@ -611,7 +611,9 @@ class _PressureHomeState extends State<PressureHome> {
   bool _refreshing = false;
   bool _online = false;
   bool _showRssiDbm = false;
+  bool _useHttpFallback = false;
   DateTime? _lastValidReadingAt;
+  DateTime? _lastUdpAt;
   int _udpPort = defaultUdpPort;
   String _lastKnownDeviceIp = '';
   double? _udpPressure1;
@@ -644,7 +646,7 @@ class _PressureHomeState extends State<PressureHome> {
 
     _pollTimer = Timer.periodic(
       statePollInterval,
-      (_) => _refresh(),
+      (_) => _checkUdpAndFallback(),
     );
 
     if (!mounted) return;
@@ -668,6 +670,7 @@ class _PressureHomeState extends State<PressureHome> {
         _online = false;
         _udpPressure1 = null;
         _udpPressure2 = null;
+        _useHttpFallback = false;
       });
       _refreshing = false;
       return;
@@ -687,8 +690,10 @@ class _PressureHomeState extends State<PressureHome> {
     setState(() {
       _state = state;
       _online = true;
+      _useHttpFallback = true;
       if (state.dataValid) {
         _lastValidReadingAt = DateTime.now();
+        _lastUdpAt = DateTime.now();
       }
     });
     _refreshing = false;
@@ -736,6 +741,8 @@ class _PressureHomeState extends State<PressureHome> {
     setState(() {
       _udpPressure1 = low;
       _udpPressure2 = high;
+      _lastUdpAt = DateTime.now();
+      _useHttpFallback = false;
       if (_state != null) {
         _online = true;
       }
@@ -743,6 +750,17 @@ class _PressureHomeState extends State<PressureHome> {
         _lastValidReadingAt = DateTime.now();
       }
     });
+  }
+
+  void _checkUdpAndFallback() {
+    if (_lastUdpAt == null) {
+      _refresh();
+      return;
+    }
+    final sinceLastUdp = DateTime.now().difference(_lastUdpAt!);
+    if (sinceLastUdp > statePollInterval) {
+      _refresh();
+    }
   }
 
   _UdpTelemetryPacket? _parseUdpPacket(List<int> data) {
@@ -907,6 +925,7 @@ class _PressureHomeState extends State<PressureHome> {
                         signalkKnown: (state?.signalkIp ?? '0.0.0.0') != '0.0.0.0',
                         rssi: state?.rssi,
                         showRssiValue: _showRssiDbm,
+                        useHttpFallback: _useHttpFallback,
                         onStatusTap: _showStatusDetails,
                         onWifiTap: _toggleRssiDisplay,
                         onSettingsTap: _showToolsSheet,
@@ -1903,6 +1922,7 @@ class _TopBar extends StatelessWidget {
     required this.signalkKnown,
     required this.rssi,
     required this.showRssiValue,
+    required this.useHttpFallback,
     required this.onStatusTap,
     required this.onWifiTap,
     required this.onSettingsTap,
@@ -1913,6 +1933,7 @@ class _TopBar extends StatelessWidget {
   final bool signalkKnown;
   final int? rssi;
   final bool showRssiValue;
+  final bool useHttpFallback;
   final VoidCallback onStatusTap;
   final VoidCallback onWifiTap;
   final VoidCallback onSettingsTap;
@@ -1975,6 +1996,27 @@ class _TopBar extends StatelessWidget {
             children: [
               Expanded(child: title),
               const SizedBox(width: 8),
+              if (useHttpFallback)
+                Container(
+                  padding: EdgeInsets.symmetric(
+                    horizontal: compact ? 6 : 8,
+                    vertical: compact ? 3 : 4,
+                  ),
+                  decoration: BoxDecoration(
+                    color: AppColors.warn.withValues(alpha: 0.15),
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(color: AppColors.warn.withValues(alpha: 0.5)),
+                  ),
+                  child: Text(
+                    'HTTP',
+                    style: TextStyle(
+                      color: AppColors.warn,
+                      fontSize: compact ? 9 : 10,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+              if (useHttpFallback) const SizedBox(width: 6),
               _StatusPill(
                 connected: connected,
                 onTap: onStatusTap,
