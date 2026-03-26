@@ -18,6 +18,7 @@ const double compactLayoutBreakpoint = 390;
 const int defaultUdpPort = 4210;
 const Duration statePollInterval = Duration(seconds: 5);
 const Duration httpFallbackPollInterval = Duration(seconds: 1);
+const Duration udpTimeoutBeforeFallback = Duration(seconds: 3);
 const int maxTransientStateFailures = 3;
 
 bool _hasTelemetryValue(double value) => value.isFinite && value > 0;
@@ -746,7 +747,7 @@ class _PressureHomeState extends State<PressureHome> {
     setState(() {
       _state = state;
       _online = true;
-      _useHttpFallback = true;
+      if (!_hasRecentUdp) _useHttpFallback = true;
       if (_hasReadableTelemetry(state)) {
         _lastValidReadingAt = DateTime.now();
       }
@@ -811,7 +812,6 @@ class _PressureHomeState extends State<PressureHome> {
         _lastValidReadingAt = readingAt;
       }
     });
-    _restartPollTimer();
   }
 
   void _restartPollTimer() {
@@ -832,7 +832,7 @@ class _PressureHomeState extends State<PressureHome> {
       return;
     }
     final sinceLastUdp = DateTime.now().difference(_lastUdpAt!);
-    if (sinceLastUdp >= statePollInterval) {
+    if (sinceLastUdp >= udpTimeoutBeforeFallback) {
       _refresh();
     }
   }
