@@ -17,6 +17,8 @@ const String prefsShowRssiDbm = 'show_rssi_dbm';
 const double compactLayoutBreakpoint = 390;
 const int defaultUdpPort = 4210;
 const Duration statePollInterval = Duration(seconds: 5);
+const Duration httpFallbackPollInterval = Duration(seconds: 1);
+const int maxTransientStateFailures = 3;
 
 bool _hasTelemetryValue(double value) => value.isFinite && value > 0;
 
@@ -642,6 +644,7 @@ class _PressureHomeState extends State<PressureHome> {
   bool _useHttpFallback = false;
   DateTime? _lastValidReadingAt;
   DateTime? _lastUdpAt;
+  int _stateFailureCount = 0;
   int _udpPort = defaultUdpPort;
   String _lastKnownDeviceIp = '';
   double? _udpPressure1;
@@ -650,6 +653,13 @@ class _PressureHomeState extends State<PressureHome> {
   double? _udpVoltage2;
   _MinuteAccumulator? _currentLowMinute;
   _MinuteAccumulator? _currentHighMinute;
+
+  Duration get _currentPollInterval =>
+      _useHttpFallback ? httpFallbackPollInterval : statePollInterval;
+
+  bool get _hasRecentUdp =>
+      _lastUdpAt != null &&
+      DateTime.now().difference(_lastUdpAt!) < const Duration(seconds: 8);
 
   @override
   void initState() {
@@ -676,10 +686,7 @@ class _PressureHomeState extends State<PressureHome> {
       await _refresh();
     }
 
-    _pollTimer = Timer.periodic(
-      statePollInterval,
-      (_) => _checkUdpAndFallback(),
-    );
+    _restartPollTimer();
 
     if (!mounted) return;
     setState(() {
@@ -697,19 +704,34 @@ class _PressureHomeState extends State<PressureHome> {
     }
 
     if (state == null) {
+      _stateFailureCount += 1;
+      if (_stateFailureCount < maxTransientStateFailures) {
+        _refreshing = false;
+        return;
+      }
+
+      final hadRecentUdp = _hasRecentUdp;
       setState(() {
-        _state = null;
-        _online = false;
-        _udpPressure1 = null;
-        _udpPressure2 = null;
-        _udpVoltage1 = null;
-        _udpVoltage2 = null;
-        _useHttpFallback = false;
+        _online = hadRecentUdp;
+        _useHttpFallback = !hadRecentUdp;
+        if (!hadRecentUdp) {
+          _state = null;
+          _udpPressure1 = null;
+          _udpPressure2 = null;
+          _udpVoltage1 = null;
+          _udpVoltage2 = null;
+        }
       });
+
+      if (!hadRecentUdp && !_discovering) {
+        unawaited(_rediscover());
+      }
+
       _refreshing = false;
       return;
     }
 
+    _stateFailureCount = 0;
     _lastKnownDeviceIp = state.localIp;
     await _ensureUdpListener(state.udpPort);
     if (!mounted) {
@@ -727,9 +749,9 @@ class _PressureHomeState extends State<PressureHome> {
       _useHttpFallback = true;
       if (_hasReadableTelemetry(state)) {
         _lastValidReadingAt = DateTime.now();
-        _lastUdpAt = DateTime.now();
       }
     });
+    _restartPollTimer();
     _refreshing = false;
   }
 
@@ -743,7 +765,7 @@ class _PressureHomeState extends State<PressureHome> {
       InternetAddress.anyIPv4,
       port,
       reuseAddress: true,
-      reusePort: true,
+      reusePort: false,
     );
 
     _udpSocket = socket;
@@ -789,6 +811,15 @@ class _PressureHomeState extends State<PressureHome> {
         _lastValidReadingAt = readingAt;
       }
     });
+    _restartPollTimer();
+  }
+
+  void _restartPollTimer() {
+    _pollTimer?.cancel();
+    _pollTimer = Timer.periodic(
+      _currentPollInterval,
+      (_) => _checkUdpAndFallback(),
+    );
   }
 
   void _checkUdpAndFallback() {
@@ -801,7 +832,7 @@ class _PressureHomeState extends State<PressureHome> {
       return;
     }
     final sinceLastUdp = DateTime.now().difference(_lastUdpAt!);
-    if (sinceLastUdp > statePollInterval) {
+    if (sinceLastUdp >= statePollInterval) {
       _refresh();
     }
   }

@@ -5,7 +5,7 @@ Flutter app (Android / iOS / macOS) para monitorización en tiempo real del sist
 ## Funcionalidad
 
 - **Telemetría en tiempo real** por UDP broadcast (presión, voltaje)
-- **Fallback HTTP** automático cuando no llega paquete UDP (`/api/state` cada 5 s)
+- **Fallback HTTP** automático cuando no llega paquete UDP (`/api/state` cada 1 s mientras no haya telemetría UDP)
 - **Dos sensores de presión**:
   - Presión de entrada (0–4 bar) con zonas WARNING / NORMAL / ALARM
   - Presión principal (0–70 bar) con zonas WARNING / NORMAL / ALARM
@@ -17,6 +17,7 @@ Flutter app (Android / iOS / macOS) para monitorización en tiempo real del sist
 - **Diagnósticos** nativos, monitor SignalK en vivo y configuración de sensores
 - **mDNS / subnet scan** para descubrimiento automático del dispositivo
 - **Pantalla siempre encendida** (wakelock)
+- **Android multicast lock** para mejorar la recepción de UDP broadcast con la app en primer plano
 
 ## Arquitectura
 
