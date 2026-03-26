@@ -18,6 +18,8 @@ const double compactLayoutBreakpoint = 390;
 const int defaultUdpPort = 4210;
 const Duration statePollInterval = Duration(seconds: 5);
 
+bool _hasTelemetryValue(double value) => value.isFinite && value > 0;
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await WakelockPlus.enable();
@@ -95,7 +97,6 @@ class DeviceState {
   factory DeviceState.fromJson(Map<String, dynamic> json) {
     double readDouble(String key) => (json[key] as num?)?.toDouble() ?? 0.0;
     int readInt(String key) => (json[key] as num?)?.toInt() ?? 0;
-
     return DeviceState(
       device: json['device']?.toString() ?? 'pressure-sensor-esp32',
       firmwareVersion: json['firmwareVersion']?.toString() ?? '--',
@@ -238,24 +239,48 @@ class SaveSettingsResult {
   }
 }
 
-class _PressureSample {
-  const _PressureSample({
-    required this.timestamp,
-    required this.value,
+class _MinuteRange {
+  const _MinuteRange({
+    required this.minuteStart,
+    required this.min,
+    required this.max,
   });
 
-  final DateTime timestamp;
-  final double value;
+  final DateTime minuteStart;
+  final double min;
+  final double max;
+}
+
+class _MinuteAccumulator {
+  _MinuteAccumulator({required this.minuteStart, required double value})
+    : min = value,
+      max = value;
+
+  final DateTime minuteStart;
+  double min;
+  double max;
+
+  void add(double value) {
+    if (value < min) min = value;
+    if (value > max) max = value;
+  }
+
+  _MinuteRange freeze() =>
+      _MinuteRange(minuteStart: minuteStart, min: min, max: max);
 }
 
 class _UdpTelemetryPacket {
   const _UdpTelemetryPacket({
     this.pressure1,
     this.pressure2,
+    this.voltage1,
+    this.voltage2,
   });
 
   final double? pressure1;
   final double? pressure2;
+  final double? voltage1;
+  final double? voltage2;
 }
 
 class DeviceService {
@@ -343,10 +368,7 @@ class DeviceService {
   Future<void> _ensureAdminSession(String password) async {
     if (_adminSessionCookie.isNotEmpty) return;
 
-    final request = http.Request(
-      'POST',
-      Uri.parse('http://$host/auth/login'),
-    );
+    final request = http.Request('POST', Uri.parse('http://$host/auth/login'));
     request.followRedirects = false;
     request.headers['Content-Type'] = 'application/x-www-form-urlencoded';
     request.bodyFields = <String, String>{
@@ -364,7 +386,9 @@ class DeviceService {
         _adminSessionCookie = match.group(0) ?? '';
         return;
       }
-      throw Exception('Login succeeded but no admin session cookie was returned');
+      throw Exception(
+        'Login succeeded but no admin session cookie was returned',
+      );
     }
 
     if (response.statusCode == 403) {
@@ -427,8 +451,9 @@ class DeviceService {
   Future<Map<String, dynamic>?> _fetchJson(String path) async {
     if (host.isEmpty) return null;
     try {
-      final response =
-          await http.get(Uri.parse('http://$host$path')).timeout(timeout);
+      final response = await http
+          .get(Uri.parse('http://$host$path'))
+          .timeout(timeout);
       if (response.statusCode != 200) return null;
       return _decodeJsonMap(response.body);
     } catch (_) {
@@ -473,28 +498,30 @@ class DeviceService {
   Future<String?> _discoverByMdns() async {
     try {
       final client = MDnsClient(
-        rawDatagramSocketFactory: (
-          dynamic host,
-          int port, {
-          bool? reuseAddress,
-          bool? reusePort,
-          int? ttl,
-        }) {
-          return RawDatagramSocket.bind(
-            host,
-            port,
-            reuseAddress: reuseAddress ?? true,
-            reusePort: reusePort ?? false,
-            ttl: ttl ?? 255,
-          );
-        },
+        rawDatagramSocketFactory:
+            (
+              dynamic host,
+              int port, {
+              bool? reuseAddress,
+              bool? reusePort,
+              int? ttl,
+            }) {
+              return RawDatagramSocket.bind(
+                host,
+                port,
+                reuseAddress: reuseAddress ?? true,
+                reusePort: reusePort ?? false,
+                ttl: ttl ?? 255,
+              );
+            },
       );
       await client.start();
 
-      await for (final PtrResourceRecord ptr in client.lookup<PtrResourceRecord>(
-        ResourceRecordQuery.serverPointer('_http._tcp.local'),
-        timeout: const Duration(seconds: 4),
-      )) {
+      await for (final PtrResourceRecord ptr
+          in client.lookup<PtrResourceRecord>(
+            ResourceRecordQuery.serverPointer('_http._tcp.local'),
+            timeout: const Duration(seconds: 4),
+          )) {
         if (!ptr.domainName.toLowerCase().contains('watermaker')) continue;
 
         final hostname =
@@ -502,9 +529,9 @@ class DeviceService {
 
         await for (final IPAddressResourceRecord ip
             in client.lookup<IPAddressResourceRecord>(
-          ResourceRecordQuery.addressIPv4(hostname),
-          timeout: const Duration(seconds: 3),
-        )) {
+              ResourceRecordQuery.addressIPv4(hostname),
+              timeout: const Duration(seconds: 3),
+            )) {
           client.stop();
           return ip.address.address;
         }
@@ -533,8 +560,9 @@ class DeviceService {
 
   Future<String?> _lookupLocalHost() async {
     try {
-      final addrs = await InternetAddress.lookup('watermaker.local')
-          .timeout(const Duration(seconds: 4));
+      final addrs = await InternetAddress.lookup(
+        'watermaker.local',
+      ).timeout(const Duration(seconds: 4));
       if (addrs.isNotEmpty) {
         return addrs.first.address;
       }
@@ -600,8 +628,8 @@ class PressureHome extends StatefulWidget {
 
 class _PressureHomeState extends State<PressureHome> {
   final DeviceService _service = DeviceService();
-  final List<_PressureSample> _lowHistory = <_PressureSample>[];
-  final List<_PressureSample> _highHistory = <_PressureSample>[];
+  final List<_MinuteRange> _lowHistory = <_MinuteRange>[];
+  final List<_MinuteRange> _highHistory = <_MinuteRange>[];
   Timer? _pollTimer;
   RawDatagramSocket? _udpSocket;
   StreamSubscription<RawSocketEvent>? _udpSubscription;
@@ -618,6 +646,10 @@ class _PressureHomeState extends State<PressureHome> {
   String _lastKnownDeviceIp = '';
   double? _udpPressure1;
   double? _udpPressure2;
+  double? _udpVoltage1;
+  double? _udpVoltage2;
+  _MinuteAccumulator? _currentLowMinute;
+  _MinuteAccumulator? _currentHighMinute;
 
   @override
   void initState() {
@@ -670,6 +702,8 @@ class _PressureHomeState extends State<PressureHome> {
         _online = false;
         _udpPressure1 = null;
         _udpPressure2 = null;
+        _udpVoltage1 = null;
+        _udpVoltage2 = null;
         _useHttpFallback = false;
       });
       _refreshing = false;
@@ -691,7 +725,7 @@ class _PressureHomeState extends State<PressureHome> {
       _state = state;
       _online = true;
       _useHttpFallback = true;
-      if (state.dataValid) {
+      if (_hasReadableTelemetry(state)) {
         _lastValidReadingAt = DateTime.now();
         _lastUdpAt = DateTime.now();
       }
@@ -734,25 +768,34 @@ class _PressureHomeState extends State<PressureHome> {
 
     final low = packet.pressure1 ?? _udpPressure1;
     final high = packet.pressure2 ?? _udpPressure2;
+    final voltage1 = packet.voltage1 ?? _udpVoltage1;
+    final voltage2 = packet.voltage2 ?? _udpVoltage2;
     if (low == null || high == null) return;
 
-    _recordPressureHistoryValues(low, high);
+    final readingAt = DateTime.now();
+    _recordPressureHistoryValues(low, high, recordedAt: readingAt);
 
     setState(() {
       _udpPressure1 = low;
       _udpPressure2 = high;
+      _udpVoltage1 = voltage1;
+      _udpVoltage2 = voltage2;
       _lastUdpAt = DateTime.now();
       _useHttpFallback = false;
       if (_state != null) {
         _online = true;
       }
-      if (_state?.dataValid == true) {
-        _lastValidReadingAt = DateTime.now();
+      if (_hasTelemetryValue(low) || _hasTelemetryValue(high)) {
+        _lastValidReadingAt = readingAt;
       }
     });
   }
 
   void _checkUdpAndFallback() {
+    final historyChanged = _rollMinuteWindows(DateTime.now());
+    if (historyChanged && mounted) {
+      setState(() {});
+    }
     if (_lastUdpAt == null) {
       _refresh();
       return;
@@ -772,6 +815,8 @@ class _PressureHomeState extends State<PressureHome> {
 
       double? low;
       double? high;
+      double? voltage1;
+      double? voltage2;
       for (final update in updates) {
         if (update is! Map<String, dynamic>) continue;
         final values = update['values'];
@@ -781,51 +826,159 @@ class _PressureHomeState extends State<PressureHome> {
           final path = value['path']?.toString() ?? '';
           final numeric = (value['value'] as num?)?.toDouble();
           if (numeric == null) continue;
-          if (path == 'environment.watermaker.pressure.low') {
+          if (_matchesTelemetryPath(path, const [
+            'environment.watermaker.pressure.low',
+            'environment.watermaker.pressure1',
+            'pressure1',
+          ])) {
             low = numeric;
-          } else if (path == 'environment.watermaker.pressure.high') {
+          } else if (_matchesTelemetryPath(path, const [
+            'environment.watermaker.pressure.high',
+            'environment.watermaker.pressure2',
+            'pressure2',
+          ])) {
             high = numeric;
+          } else if (_matchesTelemetryPath(path, const [
+            'environment.watermaker.voltage.low',
+            'environment.watermaker.voltage1',
+            'electrical.watermaker.voltage1',
+            'voltage1',
+          ])) {
+            voltage1 = numeric;
+          } else if (_matchesTelemetryPath(path, const [
+            'environment.watermaker.voltage.high',
+            'environment.watermaker.voltage2',
+            'electrical.watermaker.voltage2',
+            'voltage2',
+          ])) {
+            voltage2 = numeric;
           }
         }
       }
 
-      if (low == null && high == null) return null;
-      return _UdpTelemetryPacket(pressure1: low, pressure2: high);
+      if (low == null && high == null && voltage1 == null && voltage2 == null) {
+        return null;
+      }
+      return _UdpTelemetryPacket(
+        pressure1: low,
+        pressure2: high,
+        voltage1: voltage1,
+        voltage2: voltage2,
+      );
     } catch (_) {
       return null;
     }
   }
 
-  void _recordPressureHistoryValues(double low, double high) {
-    final now = DateTime.now();
-    if (low > 0) {
-      _lowHistory.add(_PressureSample(timestamp: now, value: low));
+  bool _matchesTelemetryPath(String path, List<String> candidates) {
+    final normalized = path.trim().toLowerCase();
+    for (final candidate in candidates) {
+      if (normalized == candidate.toLowerCase()) return true;
     }
-    if (high > 0) {
-      _highHistory.add(_PressureSample(timestamp: now, value: high));
-    }
-    _prunePressureHistory(_lowHistory, now);
-    _prunePressureHistory(_highHistory, now);
+    return false;
   }
 
-  void _prunePressureHistory(List<_PressureSample> history, DateTime now) {
-    final cutoff = now.subtract(const Duration(minutes: 5));
-    while (history.isNotEmpty && history.first.timestamp.isBefore(cutoff)) {
+  void _recordPressureHistoryValues(
+    double low,
+    double high, {
+    DateTime? recordedAt,
+  }) {
+    final now = recordedAt ?? DateTime.now();
+    _rollMinuteWindows(now);
+    _recordMinuteValue(
+      history: _lowHistory,
+      current: _currentLowMinute,
+      assign: (value) => _currentLowMinute = value,
+      value: low,
+      timestamp: now,
+    );
+    _recordMinuteValue(
+      history: _highHistory,
+      current: _currentHighMinute,
+      assign: (value) => _currentHighMinute = value,
+      value: high,
+      timestamp: now,
+    );
+  }
+
+  void _recordMinuteValue({
+    required List<_MinuteRange> history,
+    required _MinuteAccumulator? current,
+    required void Function(_MinuteAccumulator? value) assign,
+    required double value,
+    required DateTime timestamp,
+  }) {
+    if (!_hasTelemetryValue(value)) return;
+    final minuteStart = _minuteStart(timestamp);
+    if (current == null) {
+      assign(_MinuteAccumulator(minuteStart: minuteStart, value: value));
+      return;
+    }
+    if (current.minuteStart != minuteStart) {
+      _appendMinuteRange(history, current.freeze());
+      assign(_MinuteAccumulator(minuteStart: minuteStart, value: value));
+      _prunePressureHistory(history, minuteStart);
+      return;
+    }
+    current.add(value);
+  }
+
+  bool _rollMinuteWindows(DateTime now) {
+    var changed = false;
+    final minuteStart = _minuteStart(now);
+    if (_currentLowMinute != null &&
+        _currentLowMinute!.minuteStart.isBefore(minuteStart)) {
+      _appendMinuteRange(_lowHistory, _currentLowMinute!.freeze());
+      _currentLowMinute = null;
+      _prunePressureHistory(_lowHistory, minuteStart);
+      changed = true;
+    }
+    if (_currentHighMinute != null &&
+        _currentHighMinute!.minuteStart.isBefore(minuteStart)) {
+      _appendMinuteRange(_highHistory, _currentHighMinute!.freeze());
+      _currentHighMinute = null;
+      _prunePressureHistory(_highHistory, minuteStart);
+      changed = true;
+    }
+    return changed;
+  }
+
+  void _appendMinuteRange(List<_MinuteRange> history, _MinuteRange range) {
+    if (history.isNotEmpty && history.last.minuteStart == range.minuteStart) {
+      history[history.length - 1] = range;
+      return;
+    }
+    history.add(range);
+  }
+
+  void _prunePressureHistory(List<_MinuteRange> history, DateTime minuteStart) {
+    final cutoff = minuteStart.subtract(const Duration(minutes: 5));
+    while (history.isNotEmpty && history.first.minuteStart.isBefore(cutoff)) {
       history.removeAt(0);
     }
   }
 
+  DateTime _minuteStart(DateTime value) {
+    return DateTime(
+      value.year,
+      value.month,
+      value.day,
+      value.hour,
+      value.minute,
+    );
+  }
+
   ({double min, double max})? _historyRange(
-    List<_PressureSample> history,
+    List<_MinuteRange> history,
     double rangeMin,
     double rangeMax,
   ) {
     if (history.isEmpty) return null;
-    var minValue = history.first.value;
-    var maxValue = history.first.value;
+    var minValue = history.first.min;
+    var maxValue = history.first.max;
     for (final sample in history.skip(1)) {
-      if (sample.value < minValue) minValue = sample.value;
-      if (sample.value > maxValue) maxValue = sample.value;
+      if (sample.min < minValue) minValue = sample.min;
+      if (sample.max > maxValue) maxValue = sample.max;
     }
     return (
       min: minValue.clamp(rangeMin, rangeMax).toDouble(),
@@ -922,7 +1075,8 @@ class _PressureHomeState extends State<PressureHome> {
                       _TopBar(
                         connected: _online,
                         signalkAlive: state?.signalkAlive ?? false,
-                        signalkKnown: (state?.signalkIp ?? '0.0.0.0') != '0.0.0.0',
+                        signalkKnown:
+                            (state?.signalkIp ?? '0.0.0.0') != '0.0.0.0',
                         rssi: state?.rssi,
                         showRssiValue: _showRssiDbm,
                         useHttpFallback: _useHttpFallback,
@@ -935,7 +1089,7 @@ class _PressureHomeState extends State<PressureHome> {
                         online: _online,
                         running: state?.systemRunning ?? false,
                         title: _heroTitle(state),
-                        sessionRuntime: _formatDuration(state?.partialRuntimeMs ?? 0),
+                        sessionRuntime: _formatDuration(state?.uptimeMs ?? 0),
                         totalRuntime: _formatHours(state?.totalRuntimeMs ?? 0),
                       ),
                       const SizedBox(height: 8),
@@ -953,17 +1107,31 @@ class _PressureHomeState extends State<PressureHome> {
                                   padding: EdgeInsets.zero,
                                   children: [
                                     PressureCard.low(
-                                      state: _stateWithDisplayedPressures(state),
-                                      historyRange: _historyRange(_lowHistory, 0, 4),
+                                      state: _stateWithDisplayedTelemetry(
+                                        state,
+                                      ),
+                                      historyRange: _historyRange(
+                                        _lowHistory,
+                                        0,
+                                        4,
+                                      ),
                                     ),
                                     const SizedBox(height: 8),
                                     PressureCard.high(
-                                      state: _stateWithDisplayedPressures(state),
-                                      historyRange: _historyRange(_highHistory, 0, 70),
+                                      state: _stateWithDisplayedTelemetry(
+                                        state,
+                                      ),
+                                      historyRange: _historyRange(
+                                        _highHistory,
+                                        0,
+                                        70,
+                                      ),
                                     ),
                                     const SizedBox(height: 8),
                                     _InfoStrip(
-                                      detail: _formatLastReading(_lastValidReadingAt),
+                                      detail: _formatLastReading(
+                                        _lastValidReadingAt,
+                                      ),
                                     ),
                                   ],
                                 ),
@@ -979,7 +1147,8 @@ class _PressureHomeState extends State<PressureHome> {
 
   String _heroTitle(DeviceState? state) {
     if (state == null || !_online) return 'Waiting for pressure';
-    if (!state.dataValid && state.deviceError.isNotEmpty) return state.deviceError;
+    if (!state.dataValid && state.deviceError.isNotEmpty)
+      return state.deviceError;
     if (!state.dataValid) return 'System idle';
     if (state.systemRunning && _displayPressure2(state) >= 60) {
       return 'High pressure out of range';
@@ -1022,40 +1191,45 @@ class _PressureHomeState extends State<PressureHome> {
                     _service.host.isEmpty
                         ? null
                         : () => _openNativePage(
-                              DiagnosticsPage(service: _service),
-                            ),
+                            DiagnosticsPage(service: _service),
+                          ),
                   ),
                   _sheetButton(
                     'SignalK monitor',
                     _service.host.isEmpty
                         ? null
-                        : () => _openNativePage(
-                              MonitorPage(service: _service),
-                            ),
+                        : () => _openNativePage(MonitorPage(service: _service)),
                   ),
                   _sheetButton(
                     'Device settings',
                     _service.host.isEmpty
                         ? null
-                        : () => _openNativePage(
-                              SettingsPage(service: _service),
-                            ),
+                        : () =>
+                              _openNativePage(SettingsPage(service: _service)),
                   ),
                   _sheetButton(
                     'Settings menu (web)',
-                    _service.host.isEmpty ? null : () => _openDevicePath('/config'),
+                    _service.host.isEmpty
+                        ? null
+                        : () => _openDevicePath('/config'),
                   ),
                   _sheetButton(
                     'Firmware update',
-                    _service.host.isEmpty ? null : () => _openDevicePath('/update'),
+                    _service.host.isEmpty
+                        ? null
+                        : () => _openDevicePath('/update'),
                   ),
                   _sheetButton(
                     'Filesystem update',
-                    _service.host.isEmpty ? null : () => _openDevicePath('/updatefs'),
+                    _service.host.isEmpty
+                        ? null
+                        : () => _openDevicePath('/updatefs'),
                   ),
                   _sheetButton(
                     'Factory reset',
-                    _service.host.isEmpty ? null : () => _openDevicePath('/factory'),
+                    _service.host.isEmpty
+                        ? null
+                        : () => _openDevicePath('/factory'),
                   ),
                   const SizedBox(height: 10),
                   const Text(
@@ -1068,13 +1242,10 @@ class _PressureHomeState extends State<PressureHome> {
                     ),
                   ),
                   const SizedBox(height: 10),
-                  _sheetButton(
-                    'Set device address',
-                    () async {
-                      Navigator.of(context).pop();
-                      await _promptHost();
-                    },
-                  ),
+                  _sheetButton('Set device address', () async {
+                    Navigator.of(context).pop();
+                    await _promptHost();
+                  }),
                   _sheetButton(
                     _discovering ? 'Discovering...' : 'Rediscover device',
                     _discovering
@@ -1099,9 +1270,9 @@ class _PressureHomeState extends State<PressureHome> {
 
   Future<void> _openNativePage(Widget page) async {
     Navigator.of(context).pop();
-    await Navigator.of(context).push(
-      MaterialPageRoute<void>(builder: (_) => page),
-    );
+    await Navigator.of(
+      context,
+    ).push(MaterialPageRoute<void>(builder: (_) => page));
     await _refresh();
   }
 
@@ -1183,7 +1354,7 @@ class _PressureHomeState extends State<PressureHome> {
     return '$hh:$mm:$ss';
   }
 
-  DeviceState _stateWithDisplayedPressures(DeviceState state) {
+  DeviceState _stateWithDisplayedTelemetry(DeviceState state) {
     final low = _displayPressure1(state);
     final high = _displayPressure2(state);
     return DeviceState(
@@ -1201,8 +1372,8 @@ class _PressureHomeState extends State<PressureHome> {
       deviceError: state.deviceError,
       pressure1: low,
       pressure2: high,
-      voltage1: state.voltage1,
-      voltage2: state.voltage2,
+      voltage1: _displayVoltage1(state),
+      voltage2: _displayVoltage2(state),
       signalkIp: state.signalkIp,
       signalkAlive: state.signalkAlive,
       signalkServicePort: state.signalkServicePort,
@@ -1214,9 +1385,23 @@ class _PressureHomeState extends State<PressureHome> {
     );
   }
 
-  double _displayPressure1(DeviceState state) => _udpPressure1 ?? state.pressure1;
+  double _displayPressure1(DeviceState state) =>
+      _udpPressure1 ?? state.pressure1;
 
-  double _displayPressure2(DeviceState state) => _udpPressure2 ?? state.pressure2;
+  double _displayPressure2(DeviceState state) =>
+      _udpPressure2 ?? state.pressure2;
+
+  double _displayVoltage1(DeviceState state) => _udpVoltage1 ?? state.voltage1;
+
+  double _displayVoltage2(DeviceState state) => _udpVoltage2 ?? state.voltage2;
+
+  bool _hasReadableTelemetry(DeviceState state) {
+    return _hasTelemetryValue(_displayPressure1(state)) ||
+        _hasTelemetryValue(_displayPressure2(state)) ||
+        _hasTelemetryValue(_displayVoltage1(state)) ||
+        _hasTelemetryValue(_displayVoltage2(state));
+  }
+
 }
 
 class DiagnosticsPage extends StatefulWidget {
@@ -1345,8 +1530,13 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
   String _formatDiagnosticsValue(String key, dynamic value) {
     if (value == null || value.toString().isEmpty) return '--';
     if (key == 'uptimeMs') return _formatDuration((value as num).toInt());
-    if (['heapFree', 'heapMin', 'flashSize', 'sketchSize', 'freeSketchSpace']
-        .contains(key)) {
+    if ([
+      'heapFree',
+      'heapMin',
+      'flashSize',
+      'sketchSize',
+      'freeSketchSpace',
+    ].contains(key)) {
       return '${((value as num).toDouble() / 1024).round()} KB';
     }
     if (key == 'rssi') return '$value dBm';
@@ -1546,8 +1736,8 @@ class _SettingsPageState extends State<SettingsPage> {
     _maxVdc2Controller.text = _formatDecimal(settings.maxVdc2);
     _signalkMaxAttemptsController.text = settings.signalkMaxAttempts.toString();
     _outPortController.text = settings.outPort.toString();
-    _totalRuntimeHoursController.text =
-        (settings.totalRuntimeMs / 3600000).toStringAsFixed(1);
+    _totalRuntimeHoursController.text = (settings.totalRuntimeMs / 3600000)
+        .toStringAsFixed(1);
     _signalkIpController.text = settings.signalkIp;
     _apPasswordController.text = settings.apPassword;
     _adminPasswordController.text = settings.adminPassword;
@@ -1604,7 +1794,9 @@ class _SettingsPageState extends State<SettingsPage> {
     } catch (error) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(error.toString().replaceFirst('Exception: ', ''))),
+        SnackBar(
+          content: Text(error.toString().replaceFirst('Exception: ', '')),
+        ),
       );
     } finally {
       if (mounted) {
@@ -1701,7 +1893,10 @@ class _SettingsPageState extends State<SettingsPage> {
                             value: _modo,
                             items: const [
                               DropdownMenuItem(value: 0, child: Text('AP')),
-                              DropdownMenuItem(value: 1, child: Text('AP + STA')),
+                              DropdownMenuItem(
+                                value: 1,
+                                child: Text('AP + STA'),
+                              ),
                             ],
                             onChanged: (value) {
                               if (value == null) return;
@@ -1801,10 +1996,7 @@ class _SettingsPageState extends State<SettingsPage> {
         controller: controller,
         keyboardType:
             keyboardType ??
-            TextInputType.numberWithOptions(
-              decimal: !isInteger,
-              signed: false,
-            ),
+            TextInputType.numberWithOptions(decimal: !isInteger, signed: false),
         validator: (value) {
           final text = value?.trim() ?? '';
           if (text.isEmpty) return allowEmpty ? null : 'Required';
@@ -1815,9 +2007,7 @@ class _SettingsPageState extends State<SettingsPage> {
           labelText: label,
           filled: true,
           fillColor: Colors.white.withValues(alpha: 0.04),
-          border: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(14),
-          ),
+          border: OutlineInputBorder(borderRadius: BorderRadius.circular(14)),
         ),
       ),
     );
@@ -1839,16 +2029,16 @@ class _SettingsPageState extends State<SettingsPage> {
           labelText: label,
           filled: true,
           fillColor: Colors.white.withValues(alpha: 0.04),
-          border: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(14),
-          ),
+          border: OutlineInputBorder(borderRadius: BorderRadius.circular(14)),
         ),
       ),
     );
   }
 
   String? _validateDouble(String text) =>
-      double.tryParse(text.replaceAll(',', '.')) == null ? 'Invalid number' : null;
+      double.tryParse(text.replaceAll(',', '.')) == null
+      ? 'Invalid number'
+      : null;
 
   String? _validateInt(String text) =>
       int.tryParse(text) == null ? 'Invalid number' : null;
@@ -1884,10 +2074,7 @@ class _SettingsPageState extends State<SettingsPage> {
 }
 
 class _SettingsSection extends StatelessWidget {
-  const _SettingsSection({
-    required this.title,
-    required this.child,
-  });
+  const _SettingsSection({required this.title, required this.child});
 
   final String title;
   final Widget child;
@@ -1902,10 +2089,7 @@ class _SettingsSection extends StatelessWidget {
         children: [
           Text(
             title,
-            style: const TextStyle(
-              fontSize: 16,
-              fontWeight: FontWeight.w800,
-            ),
+            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
           ),
           const SizedBox(height: 10),
           child,
@@ -2005,7 +2189,9 @@ class _TopBar extends StatelessWidget {
                   decoration: BoxDecoration(
                     color: AppColors.warn.withValues(alpha: 0.15),
                     borderRadius: BorderRadius.circular(6),
-                    border: Border.all(color: AppColors.warn.withValues(alpha: 0.5)),
+                    border: Border.all(
+                      color: AppColors.warn.withValues(alpha: 0.5),
+                    ),
                   ),
                   child: Text(
                     'HTTP',
@@ -2188,10 +2374,7 @@ class _InfoStrip extends StatelessWidget {
               ),
             ),
           ),
-          Text(
-            detail,
-            style: const TextStyle(color: AppColors.muted),
-          ),
+          Text(detail, style: const TextStyle(color: AppColors.muted)),
         ],
       ),
     );
@@ -2240,19 +2423,13 @@ class _StartupScreen extends StatelessWidget {
               const SizedBox(height: 18),
               const Text(
                 'WaterMaker',
-                style: TextStyle(
-                  fontSize: 28,
-                  fontWeight: FontWeight.w900,
-                ),
+                style: TextStyle(fontSize: 28, fontWeight: FontWeight.w900),
               ),
               const SizedBox(height: 8),
               const Text(
                 'Preparing diagnostics and pressure telemetry...',
                 textAlign: TextAlign.center,
-                style: TextStyle(
-                  color: AppColors.muted,
-                  fontSize: 15,
-                ),
+                style: TextStyle(color: AppColors.muted, fontSize: 15),
               ),
               const SizedBox(height: 20),
               ClipRRect(
@@ -2281,6 +2458,7 @@ class PressureCard extends StatelessWidget {
     required this.zones,
     required this.status,
     required this.stateText,
+    required this.voltage,
     this.historyRange,
   });
 
@@ -2289,14 +2467,11 @@ class PressureCard extends StatelessWidget {
     ({double min, double max})? historyRange,
   }) {
     final bounded = state.pressure1.clamp(0.0, 4.0);
-    final zone = _zoneForValue(
-      bounded,
-      const [
-        ZoneSpec(0, 1, AppColors.warn),
-        ZoneSpec(1, 3, AppColors.ok),
-        ZoneSpec(3, 4, AppColors.danger),
-      ],
-    );
+    final zone = _zoneForValue(bounded, const [
+      ZoneSpec(0, 1, AppColors.warn),
+      ZoneSpec(1, 3, AppColors.ok),
+      ZoneSpec(3, 4, AppColors.danger),
+    ]);
     return PressureCard(
       title: 'Presion de entrada',
       value: bounded.toDouble(),
@@ -2309,6 +2484,7 @@ class PressureCard extends StatelessWidget {
       ],
       status: zone.label,
       stateText: zone.state,
+      voltage: state.voltage1,
       historyRange: historyRange,
     );
   }
@@ -2318,15 +2494,12 @@ class PressureCard extends StatelessWidget {
     ({double min, double max})? historyRange,
   }) {
     final bounded = state.pressure2.clamp(0.0, 70.0);
-    final zone = _zoneForValue(
-      bounded,
-      const [
-        ZoneSpec(0, 50, AppColors.warn),
-        ZoneSpec(50, 57, AppColors.ok),
-        ZoneSpec(57, 60, AppColors.warn),
-        ZoneSpec(60, 70, AppColors.danger),
-      ],
-    );
+    final zone = _zoneForValue(bounded, const [
+      ZoneSpec(0, 50, AppColors.warn),
+      ZoneSpec(50, 57, AppColors.ok),
+      ZoneSpec(57, 60, AppColors.warn),
+      ZoneSpec(60, 70, AppColors.danger),
+    ]);
     return PressureCard(
       title: 'Presion principal',
       value: bounded.toDouble(),
@@ -2340,6 +2513,7 @@ class PressureCard extends StatelessWidget {
       ],
       status: zone.label,
       stateText: zone.state,
+      voltage: state.voltage2,
       historyRange: historyRange,
     );
   }
@@ -2351,12 +2525,15 @@ class PressureCard extends StatelessWidget {
   final List<ZoneSpec> zones;
   final String status;
   final String stateText;
+  final double voltage;
   final ({double min, double max})? historyRange;
 
   @override
   Widget build(BuildContext context) {
-    final progress =
-        ((value - rangeMin) / (rangeMax - rangeMin)).clamp(0.0, 1.0);
+    final progress = ((value - rangeMin) / (rangeMax - rangeMin)).clamp(
+      0.0,
+      1.0,
+    );
     final historyMin = historyRange?.min;
     final historyMax = historyRange?.max;
     final statusColor = _statusColor(status);
@@ -2469,13 +2646,15 @@ class PressureCard extends StatelessWidget {
                     ),
                     if (historyMin != null)
                       _RangeMarker(
-                        leftFactor: ((historyMin - rangeMin) / (rangeMax - rangeMin))
-                            .clamp(0.0, 1.0),
+                        leftFactor:
+                            ((historyMin - rangeMin) / (rangeMax - rangeMin))
+                                .clamp(0.0, 1.0),
                       ),
                     if (historyMax != null)
                       _RangeMarker(
-                        leftFactor: ((historyMax - rangeMin) / (rangeMax - rangeMin))
-                            .clamp(0.0, 1.0),
+                        leftFactor:
+                            ((historyMax - rangeMin) / (rangeMax - rangeMin))
+                                .clamp(0.0, 1.0),
                       ),
                   ],
                 ),
@@ -2487,7 +2666,10 @@ class PressureCard extends StatelessWidget {
                   children: zones
                       .map(
                         (zone) => Expanded(
-                          flex: math.max(1, ((zone.to - zone.from) * 100).round()),
+                          flex: math.max(
+                            1,
+                            ((zone.to - zone.from) * 100).round(),
+                          ),
                           child: Container(
                             height: 4,
                             color: zone.color.withValues(alpha: 0.8),
@@ -2499,8 +2681,13 @@ class PressureCard extends StatelessWidget {
               ),
               const SizedBox(height: 8),
               Text(
-                'Status: $stateText',
-                style: const TextStyle(color: AppColors.muted, fontSize: 16),
+                _hasTelemetryValue(voltage)
+                    ? 'Voltaje: ${voltage.toStringAsFixed(3)} V'
+                    : 'Voltaje: --',
+                style: const TextStyle(
+                  color: AppColors.muted,
+                  fontSize: 16,
+                ),
               ),
             ],
           ),
@@ -2597,35 +2784,39 @@ class _EmptyState extends StatelessWidget {
       padding: const EdgeInsets.all(4),
       child: Center(
         child: Container(
-        padding: const EdgeInsets.all(18),
-        decoration: _cardDecoration(),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Icon(Icons.sensors_rounded, color: AppColors.accent, size: 42),
-            const SizedBox(height: 14),
-            const Text(
-              'No device connected',
-              style: TextStyle(fontSize: 22, fontWeight: FontWeight.w800),
-            ),
-            const SizedBox(height: 8),
-            const Text(
-              'Discover your Watermaker on the local network or set the device address manually.',
-              textAlign: TextAlign.center,
-              style: TextStyle(color: AppColors.muted),
-            ),
-            const SizedBox(height: 18),
-            FilledButton(
-              onPressed: discovering ? null : onDiscover,
-              child: Text(discovering ? 'Discovering...' : 'Discover device'),
-            ),
-            const SizedBox(height: 10),
-            OutlinedButton(
-              onPressed: onSetHost,
-              child: const Text('Set address manually'),
-            ),
-          ],
-        ),
+          padding: const EdgeInsets.all(18),
+          decoration: _cardDecoration(),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(
+                Icons.sensors_rounded,
+                color: AppColors.accent,
+                size: 42,
+              ),
+              const SizedBox(height: 14),
+              const Text(
+                'No device connected',
+                style: TextStyle(fontSize: 22, fontWeight: FontWeight.w800),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'Discover your Watermaker on the local network or set the device address manually.',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: AppColors.muted),
+              ),
+              const SizedBox(height: 18),
+              FilledButton(
+                onPressed: discovering ? null : onDiscover,
+                child: Text(discovering ? 'Discovering...' : 'Discover device'),
+              ),
+              const SizedBox(height: 10),
+              OutlinedButton(
+                onPressed: onSetHost,
+                child: const Text('Set address manually'),
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -2751,7 +2942,9 @@ class _WifiPill extends StatelessWidget {
                     padding: const EdgeInsets.only(right: 2),
                     child: Container(
                       width: compact ? 3.5 : 4,
-                      height: compact ? [4.0, 7.0, 10.0, 12.0][index] : [5.0, 8.0, 11.0, 14.0][index],
+                      height: compact
+                          ? [4.0, 7.0, 10.0, 12.0][index]
+                          : [5.0, 8.0, 11.0, 14.0][index],
                       decoration: BoxDecoration(
                         borderRadius: BorderRadius.circular(999),
                         color: active
